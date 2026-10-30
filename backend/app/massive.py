@@ -54,6 +54,17 @@ class MassiveClient:
         )
         return data.get("results") or []
 
+    def ticker_events(self, ticker: str) -> list[tuple[str, str]]:
+        """(date, symbol) pairs: from each date on, the company traded under that symbol."""
+        try:
+            data = self._get(f"/vX/reference/tickers/{ticker}/events", {"types": "ticker_change"})
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return []
+            raise
+        events = (data.get("results") or {}).get("events") or []
+        return sorted((e["date"], e["ticker_change"]["ticker"]) for e in events)
+
     def splits(self, since: str, until: str | None = None) -> list[dict]:
         """Splits executed between since and until (default today); follows pagination."""
         params: dict | None = {

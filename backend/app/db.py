@@ -26,6 +26,11 @@ CREATE TABLE IF NOT EXISTS splits_applied (
     execution_date TEXT NOT NULL,
     PRIMARY KEY (ticker, execution_date)
 );
+-- Tickers whose history we've already rebuilt across old symbols (renames)
+CREATE TABLE IF NOT EXISTS history_checked (
+    ticker     TEXT PRIMARY KEY,
+    checked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rs_ratings (
     date        TEXT NOT NULL,
     ticker      TEXT NOT NULL,

@@ -78,21 +78,102 @@ def fetch_prices(conn: sqlite3.Connection, client: MassiveClient, tickers: set[s
         print(f"  [{n}/{len(todo)}] {day}: {label}")
 
 
+def history_window(conn: sqlite3.Connection) -> tuple[str, str] | None:
+    first = conn.execute("SELECT MIN(date) FROM fetched_dates WHERE rows > 0").fetchone()[0]
+    if not first:
+        return None
+    return first, (date.today() - timedelta(days=1)).isoformat()
+
+
+def symbol_periods(
+    client: MassiveClient, ticker: str, first_bar: str | None
+) -> list[tuple[str, str, str | None]]:
+    """(symbol, start, end) periods the company traded under, oldest first; end None = now."""
+    events = client.ticker_events(ticker)
+    if events and events[-1][1] != ticker and first_bar:
+        # The switch to the current symbol isn't in the feed (e.g. FI -> FISV);
+        # assume it happened on the first day the current symbol shows up in our data
+        events.append((first_bar, ticker))
+    if not events or events[-1][1] != ticker:
+        return [(ticker, "0000-00-00", None)]
+    periods = []
+    for i, (start, symbol) in enumerate(events):
+        end = None
+        if i + 1 < len(events):
+            end = (date.fromisoformat(events[i + 1][0]) - timedelta(days=1)).isoformat()
+        periods.append((symbol, start, end))
+    return periods
+
+
+def refetch_history(conn: sqlite3.Connection, client: MassiveClient, ticker: str) -> str:
+    """Replace a company's bars with its full history, stitched across any old symbols.
+
+    Also drops bars that belonged to a different security that used the symbol earlier
+    (BNY was a muni fund before BNY Mellon moved from BK to BNY).
+    """
+    window = history_window(conn)
+    if window is None:
+        return "no data yet"
+    lo, hi = window
+    first_bar = conn.execute("SELECT MIN(date) FROM daily_bars WHERE ticker = ?", (ticker,)).fetchone()[0]
+    rows, used = [], []
+    for symbol, start, end in symbol_periods(client, ticker, first_bar):
+        a, b = max(start, lo), min(end or hi, hi)
+        if a > b:
+            continue
+        bars = client.ticker_daily(symbol, a, b)
+        rows += [(ticker, bar_date(bar), bar["c"], bar.get("v", 0)) for bar in bars]
+        used.append(f"{symbol} {len(bars)}")
+    with conn:
+        conn.execute("DELETE FROM daily_bars WHERE ticker = ?", (ticker,))
+        conn.executemany("INSERT OR REPLACE INTO daily_bars VALUES (?, ?, ?, ?)", rows)
+    return f"{len(rows)} bars ({', '.join(used) or 'none'})"
+
+
+def fix_renames(conn: sqlite3.Connection, client: MassiveClient, tickers: set[str]) -> None:
+    """Rebuild history for tickers that look renamed: short history or an impossible jump."""
+    spy_days = conn.execute("SELECT COUNT(*) FROM daily_bars WHERE ticker = ?", (BENCHMARK,)).fetchone()[0]
+    counts = {
+        r["ticker"]: r["n"]
+        for r in conn.execute("SELECT ticker, COUNT(*) AS n FROM daily_bars GROUP BY ticker")
+    }
+    jumps = {
+        r["ticker"]
+        for r in conn.execute(
+            """SELECT DISTINCT ticker FROM (
+                   SELECT ticker, close / LAG(close) OVER (PARTITION BY ticker ORDER BY date) AS ratio
+                   FROM daily_bars)
+               WHERE ratio > 3 OR ratio < 1.0 / 3"""
+        )
+    }
+    checked = {r["ticker"] for r in conn.execute("SELECT ticker FROM history_checked")}
+    # A few missing days is normal (trading halts); a big gap usually means a rename
+    candidates = sorted(
+        t for t in tickers - checked if counts.get(t, 0) < spy_days - 5 or t in jumps
+    )
+    for ticker in candidates:
+        print(f"  {ticker}: {refetch_history(conn, client, ticker)}")
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO history_checked VALUES (?, ?)", (ticker, date.today().isoformat())
+            )
+    print(f"Renames: checked {len(candidates)} tickers with short or broken history")
+
+
 def apply_splits(conn: sqlite3.Connection, client: MassiveClient, tickers: set[str]) -> None:
     """Refetch a ticker's history when a split happened after some of its bars were fetched.
 
     Bars are split-adjusted as of the day they were fetched, so only bars fetched on or
     before the execution date are stale.
     """
-    first = conn.execute("SELECT MIN(date) FROM fetched_dates WHERE rows > 0").fetchone()[0]
-    if not first:
+    window = history_window(conn)
+    if window is None:
         return
     applied = {(r["ticker"], r["execution_date"]) for r in conn.execute("SELECT * FROM splits_applied")}
     splits = [
-        s for s in client.splits(since=first)
+        s for s in client.splits(since=window[0])
         if s["ticker"] in tickers and (s["ticker"], s["execution_date"]) not in applied
     ]
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
     refetched = 0
     for s in splits:
         ticker, executed = s["ticker"], s["execution_date"]
@@ -102,14 +183,8 @@ def apply_splits(conn: sqlite3.Connection, client: MassiveClient, tickers: set[s
             (ticker, executed, executed),
         ).fetchone()
         if stale:
-            bars = client.ticker_daily(ticker, first, yesterday)
-            print(f"  split {ticker} {s['split_from']:g}:{s['split_to']:g} on {executed}: refetched {len(bars)} bars")
-            with conn:
-                conn.execute("DELETE FROM daily_bars WHERE ticker = ?", (ticker,))
-                conn.executemany(
-                    "INSERT INTO daily_bars VALUES (?, ?, ?, ?)",
-                    [(ticker, bar_date(b), b["c"], b.get("v", 0)) for b in bars],
-                )
+            result = refetch_history(conn, client, ticker)
+            print(f"  split {ticker} {s['split_from']:g}:{s['split_to']:g} on {executed}: refetched {result}")
             refetched += 1
         with conn:
             conn.execute("INSERT INTO splits_applied VALUES (?, ?)", (ticker, executed))
@@ -168,6 +243,7 @@ def main() -> None:
         client = MassiveClient()
         tickers = load_companies(conn)
         fetch_prices(conn, client, tickers, args.days)
+        fix_renames(conn, client, tickers)
         apply_splits(conn, client, tickers)
     compute_rs(conn)
     print_summary(conn)
